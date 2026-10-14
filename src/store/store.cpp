@@ -433,13 +433,15 @@ expected<Cursor> Store::Inner::close(Cursor committed, Cursor ready_at, bool in_
 
 expected<Cursor> Store::Inner::append(Cursor from, Cursor to) {
     if (from == to) return to;
+    KLADDE_TRY(ensure_journal_page());
     std::vector<std::uint8_t> payload;
     payload.reserve(to.bytes - from.bytes);
     std::uint64_t cursor = journal.cursor;
-    JournalCuts cuts = journal_cuts;
-    ops.encode(from, to, cursor, cuts, payload);
+    // The journal's cuts take the transaction's in place: copying them would
+    // make every append cost as much as the journal has cuts. A failure from
+    // here on poisons the store, which then needs them no more.
+    ops.encode(from, to, cursor, journal_cuts, payload);
     ops.mark_start(from.at);
-    KLADDE_TRY(ensure_journal_page());
     std::uint64_t before = journal.bytes;
     auto r = journal.append(payload, *storage,
                             [this](Storage&) { return take_page(Page::journal()); });
@@ -448,7 +450,6 @@ expected<Cursor> Store::Inner::append(Cursor from, Cursor to) {
         return std::move(r).error();
     }
     journal.cursor = cursor;
-    journal_cuts = std::move(cuts);
     stats.journal_bytes += journal.bytes - before;
     stats.transactions += 1;
     return to;

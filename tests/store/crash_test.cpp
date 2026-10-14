@@ -124,7 +124,9 @@ void run(std::uint64_t seed, Options const& opts, bool mixed) {
     for (int k = 0; k < 4; ++k) {
         std::vector<bool> keep;
         for (std::size_t i = 0; i < n; ++i) keep.push_back(rng.below(2) == 0);
-        images.push_back(storage.crash_image([&](std::size_t i) { return bool(keep[i]); }));
+        // A commit on a worker may still be writing: what it writes after the
+        // count is lost, as a power cut now would lose it.
+        images.push_back(storage.crash_image([&](std::size_t i) { return i < keep.size() && keep[i]; }));
     }
     for (Bytes& image : images) {
         Model got = recovered(std::move(image), opts);

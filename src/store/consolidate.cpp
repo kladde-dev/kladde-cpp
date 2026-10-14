@@ -275,6 +275,12 @@ void Store::Inner::rewrite_table_victims(Flush& f, std::vector<std::uint32_t> co
     }
 }
 
+// GCC 13 at -O2 believes the engaged `std::optional<Offer>`s below may hold
+// uninitialized fields, which every `Offer` constructor initializes.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 expected<void> Store::Inner::budget_loop(Flush& f, Output& out) {
     double budget = std::max(std::round(cons.budget), 0.0);
     double lambda = opts.churn_floor, theta = opts.theta;
@@ -327,6 +333,9 @@ expected<void> Store::Inner::budget_loop(Flush& f, Output& out) {
     }
     return {};
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 std::vector<std::uint32_t> Store::Inner::cut_fillers(Flush const& f, std::size_t room_bytes) {
     // Entries restated among others take a little more than they did: keep a
