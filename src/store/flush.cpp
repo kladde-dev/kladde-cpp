@@ -43,7 +43,56 @@ expected<void> Store::Inner::flush_now() {
     auto [committed, ready_at] = committed_and_ready(tx, ops.end());
     KLADDE_TRY_ASSIGN(Cursor c, append(committed, ready_at));
     tx = tx.with_committed(c);
-    return fold_journal(c);
+    // An explicit flush returns once what it folded is durable.
+    explicit_flush = true;
+    auto r = fold_journal(c);
+    explicit_flush = false;
+    KLADDE_TRY(r);
+    return join_pending();
+}
+
+expected<void> Store::Inner::join_pending() {
+    if (!pending) return {};
+    PendingCommit p = std::move(*pending);
+    pending.reset();
+    p.worker.join();
+    if (!*p.result) {
+        poisoned = true;
+        return p.result->error();
+    }
+    for (std::uint32_t page : p.release) {
+        KLADDE_DEBUG_CHECK(state.pages[page].is(Page::State::fallback), "a released page is not fallback");
+        state.pages[page] = Page::reusable();
+        ready.insert(page);
+    }
+    return {};
+}
+
+expected<void> Store::Inner::seal() {
+    // Without a reusable page it does not seal: a page added at the end now
+    // would lie below every page the flush adds after it, and keep the file
+    // from being truncated to them.
+    if (ready.empty()) return {};
+    // The page is taken now, so that the flush's own pages cannot be it, and
+    // a session's first flush clears it before the seal names it
+    // (spec/journal.md#the-start-of-a-session).
+    std::uint32_t jp = *ready.begin();
+    ready.erase(ready.begin());
+    if (first_flush) {
+        // Synced before the seal can name it: write-back is unordered, and a
+        // seal that reached the disk without the zeros would lead recovery
+        // into whatever a lost header's journal left in the page, under the
+        // epoch this session re-issues.
+        KLADDE_TRY(storage->write_at(*new_page(), std::uint64_t{jp} * PAGE_SIZE));
+        KLADDE_TRY(storage->sync());
+    }
+    state.pages[jp] = Page::journal();
+    std::uint64_t before = journal.bytes;
+    KLADDE_TRY(journal.append(seal_payload(jp), *storage,
+                              [this](Storage&) { return take_page(Page::journal()); }));
+    stats.journal_bytes += journal.bytes - before;
+    sealed_next = jp;
+    return {};
 }
 
 expected<bool> Store::Inner::flush_if_journal_exceeds(double fraction) {
@@ -72,6 +121,10 @@ expected<void> Store::Inner::fold_journal(Cursor committed) {
 }
 
 expected<void> Store::Inner::flush_inner(Cursor committed) {
+    // One commit at a time: the pages the last one freed become reusable only
+    // through its `fsync`.
+    KLADDE_TRY(join_pending());
+    if (opts.seal && !journal.is_recovered() && !journal.is_empty()) KLADDE_TRY(seal());
     std::uint64_t e = epoch + 1;
     state.flush_epoch = e;
     Flush f;
@@ -398,10 +451,10 @@ expected<void> Store::Inner::settle(Flush& f, std::vector<std::uint32_t> const& 
 expected<void> Store::Inner::write_small_chains(Flush& f) {
     std::uint64_t e = state.flush_epoch;
     for (Chain chain : {Chain::schema, Chain::private_}) {
-        auto& pending = chain == Chain::schema ? schema_pending : private_pending;
-        if (!pending) continue;
-        std::vector<std::uint8_t> bytes = std::move(*pending);
-        pending.reset();
+        auto& content = chain == Chain::schema ? schema_pending : private_pending;
+        if (!content) continue;
+        std::vector<std::uint8_t> bytes = std::move(*content);
+        content.reset();
         auto& list = chain == Chain::schema ? state.schema : state.private_;
         std::vector<std::uint32_t> old = std::move(list);
         list.clear();
@@ -942,9 +995,13 @@ void Store::Inner::note_placed(Flush const& f, std::uint32_t page, std::size_t c
 // ---------------------------------------------------------------- commit
 
 expected<void> Store::Inner::commit(std::uint64_t e, Output out) {
-    // The next journal starts in the lowest reusable page, or past the end.
+    // The next journal starts where the seal said, or else in the lowest
+    // reusable page, or past the end.
+    std::optional<std::uint32_t> sealed = std::exchange(sealed_next, std::nullopt);
     std::uint32_t jp;
-    if (!ready.empty()) {
+    if (sealed) {
+        jp = *sealed;
+    } else if (!ready.empty()) {
         jp = *ready.begin();
         ready.erase(ready.begin());
     } else {
@@ -973,10 +1030,9 @@ expected<void> Store::Inner::commit(std::uint64_t e, Output out) {
         stats.table_pages_written += 1;
     }
     // A session's first flush clears the page it names for the next journal
-    // (spec/journal.md#the-start-of-a-session).
-    if (first_flush && jp < file_pages)
+    // (spec/journal.md#the-start-of-a-session), unless the seal did already.
+    if (first_flush && !sealed && jp < file_pages)
         KLADDE_TRY(storage->write_at(*new_page(), std::uint64_t{jp} * PAGE_SIZE));
-    KLADDE_TRY(storage->sync());
     header.journal_pointer = jp;
     header.format_version = FORMAT_VERSION;
     header.min_reader_version = MIN_READER_VERSION;
@@ -985,7 +1041,27 @@ expected<void> Store::Inner::commit(std::uint64_t e, Output out) {
     header.private_head = state.private_.empty() ? 0 : state.private_.front();
     auto hbuf = new_page();
     encode_page(*hbuf, &header, KIND_TABLE, e, out.header_content);
-    KLADDE_TRY(storage->write_at(*hbuf, std::uint64_t{slot} * PAGE_SIZE));
+    // The `fsync` and the header write, on a thread of their own when a
+    // mutation triggered the flush and the journal is sealed: the next
+    // journal is reachable through the seal whichever header governs, so
+    // appends may go on meanwhile.
+    std::uint64_t at = std::uint64_t{slot} * PAGE_SIZE;
+    std::optional<PendingCommit> worker;
+    std::unique_ptr<Storage> second;
+    if (sealed && opts.sync_on_worker && !explicit_flush) second = storage->try_clone();
+    if (second) {
+        stats.commits_on_worker += 1;
+        auto result = std::make_unique<expected<void>>();
+        auto page = std::make_unique<PageBuf>(*hbuf);
+        std::thread t([s = std::move(second), page = std::move(page), at, r = result.get()] {
+            auto synced = s->sync();
+            *r = synced ? s->write_at(*page, at) : synced;
+        });
+        worker = PendingCommit{std::move(t), std::move(result), {}};
+    } else {
+        KLADDE_TRY(storage->sync());
+        KLADDE_TRY(storage->write_at(*hbuf, at));
+    }
     stats.headers_written += 1;
 
     // The pages the flush filled are in the world now.
@@ -995,11 +1071,19 @@ expected<void> Store::Inner::commit(std::uint64_t e, Output out) {
         page = Page::live(e, page.coverage, page.kind);
     }
 
-    // Bookkeeping: the rotation of reusable pages first.
-    for (std::uint32_t p : std::exchange(retiring, {})) {
-        KLADDE_DEBUG_CHECK(state.pages[p].is(Page::State::fallback), "a retiring page is not fallback");
-        state.pages[p] = Page::reusable();
-        ready.insert(p);
+    // Bookkeeping: the rotation of reusable pages first. The pages the commit
+    // before freed are reusable once this commit's `fsync` is done, which a
+    // worker reports when it is joined.
+    std::vector<std::uint32_t> release = std::exchange(retiring, {});
+    if (worker) {
+        worker->release = std::move(release);
+        pending = std::move(worker);
+    } else {
+        for (std::uint32_t p : release) {
+            KLADDE_DEBUG_CHECK(state.pages[p].is(Page::State::fallback), "a retiring page is not fallback");
+            state.pages[p] = Page::reusable();
+            ready.insert(p);
+        }
     }
     std::vector<std::uint32_t> next_retiring;
     std::vector<std::uint32_t> candidates = sorted(state.dropped_candidates);
@@ -1039,7 +1123,9 @@ expected<void> Store::Inner::commit(std::uint64_t e, Output out) {
     epoch = e;
     for (std::uint32_t p : written) state.rebucket(p);
     if (jp < file_pages) {
-        KLADDE_DEBUG_CHECK(state.pages[jp].is(Page::State::reusable), "the next journal's page is in use");
+        KLADDE_DEBUG_CHECK(state.pages[jp].is(Page::State::reusable) ||
+                               (sealed && state.pages[jp].is(Page::State::journal)),
+                           "the next journal's page is in use");
         state.pages[jp] = Page::journal();
     }
     journal = JournalWriter(e + 1, jp);

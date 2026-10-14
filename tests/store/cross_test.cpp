@@ -108,4 +108,22 @@ TEST(Cross, WritesFilesForAnotherImplementation) {
         out << "sequence " << hex(model) << "\nroot_fingerprint " << hex(fp) << "\nschema " << hex(schema)
             << "\n";
     }
+    // Files whose last header write was lost after more was appended: a
+    // reader must follow the seal to find the appended transactions.
+    for (std::uint64_t seed = 1; seed <= 20; ++seed) {
+        std::string name = "cpp-lost-header-" + std::to_string(seed);
+        test::Rng rng{seed | 1};
+        MemoryStorage storage = MemoryStorage::with_crash_tracking();
+        Store store = Store::create(test::boxed(storage)).value();
+        Bytes model;
+        edits(store, model, rng, 300, 29);
+        store.flush().value();
+        edits(store, model, rng, 40, 0);
+        Bytes image = storage.crash_image([](std::size_t i) { return i != 0; });
+        std::ofstream(std::filesystem::path(dir) / (name + ".kladde"), std::ios::binary)
+            .write(reinterpret_cast<char const*>(image.data()), static_cast<std::streamsize>(image.size()));
+        std::ofstream out(std::filesystem::path(dir) / (name + ".expected"));
+        out << "sequence " << hex(model) << "\nroot_fingerprint " << hex(std::array<std::uint8_t, 16>{})
+            << "\nschema \n";
+    }
 }

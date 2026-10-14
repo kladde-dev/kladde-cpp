@@ -239,6 +239,14 @@ using DecodedCuts = std::vector<DecodedCut>;
 expected<void> decode_records(std::span<std::uint8_t const> input, std::uint64_t& cursor,
                               DecodedCuts& cuts, Records& into);
 
+/// The records of a seal's transaction: the escape (a `Write` of no bytes at
+/// delta 0), escape 0, and the page where the next epoch's journal begins
+/// (spec/journal.md#seals).
+std::vector<std::uint8_t> seal_payload(std::uint32_t page);
+
+/// The page a transaction's records name if they are a seal.
+std::optional<std::uint32_t> parse_seal(std::span<std::uint8_t const> payload);
+
 /// Supplies a page, existing in the file, for the journal to continue on.
 using NextPage = std::function<expected<std::uint32_t>(Storage&)>;
 
@@ -254,6 +262,9 @@ public:
 
     /// Whether no transaction has been appended.
     bool is_empty() const { return transactions == 0; }
+    /// Whether this is the journal of an earlier session, which nothing may
+    /// be appended to.
+    bool is_recovered() const { return recovered_; }
     /// Whether a transaction of about `n` record bytes, appended now, would
     /// keep the journal within `budget` pages. The next page is taken only
     /// once the stream continues past the current one, so a stream that ends
@@ -303,14 +314,14 @@ struct Recovered {
     /// The records of the complete transactions, in order, each transaction's
     /// start marked.
     Records records;
-    /// How many complete transactions there were.
+    /// How many complete transactions there were, seals included.
     std::size_t transactions = 0;
-    /// The pages the valid part of the journal occupies.
+    /// The pages the valid part of the journals occupies.
     std::vector<std::uint32_t> pages;
 };
 
 /// Reads the valid prefix of the journal of epoch `epoch` starting at
-/// `first_page`.
+/// `first_page`, and of the journals of later epochs that seals lead to.
 expected<Recovered> recover(Storage const& storage, std::uint64_t epoch, std::uint32_t first_page);
 
 }  // namespace kladde::store

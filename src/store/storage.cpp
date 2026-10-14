@@ -111,6 +111,14 @@ expected<void> FileStorage::sync() {
     return {};
 }
 
+std::unique_ptr<Storage> FileStorage::try_clone() const {
+    // A duplicate descriptor shares the open file description, and with it
+    // the lock, which stays held until every descriptor is closed.
+    int fd = ::fcntl(fd_, F_DUPFD_CLOEXEC, 0);
+    if (fd < 0) return nullptr;
+    return std::unique_ptr<Storage>(new FileStorage(fd));
+}
+
 // ---------------------------------------------------------------- MemoryStorage
 
 struct MemoryStorage::State {
@@ -200,6 +208,10 @@ void MemoryStorage::fail_syncs() {
 void MemoryStorage::fail_after(std::uint64_t n) {
     std::lock_guard lock(state_->mutex);
     state_->writes_left = n;
+}
+
+std::unique_ptr<Storage> MemoryStorage::try_clone() const {
+    return std::make_unique<MemoryStorage>(*this);
 }
 
 expected<std::uint64_t> MemoryStorage::size() const {

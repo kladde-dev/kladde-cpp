@@ -20,6 +20,8 @@ static_assert(store::MAX_PAGE_CONTENT == kladde::max_page_content);
 Store::Inner::Inner(std::unique_ptr<Storage> s, Options o, JournalWriter j)
     : storage(std::move(s)), opts(std::move(o)), journal(std::move(j)) {}
 
+Store::Inner::~Inner() { (void)join_pending(); }
+
 // ---------------------------------------------------------------- opening
 
 expected<Store> Store::create(std::unique_ptr<Storage> storage, Options opts) {

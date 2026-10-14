@@ -283,6 +283,23 @@ expected<void> decode_records(std::span<std::uint8_t const> input, std::uint64_t
     return {};
 }
 
+// ---------------------------------------------------------------- seals
+
+std::vector<std::uint8_t> seal_payload(std::uint32_t page) {
+    std::vector<std::uint8_t> out{0x00, 0x00, 0x00};
+    put_varint(out, page);
+    return out;
+}
+
+std::optional<std::uint32_t> parse_seal(std::span<std::uint8_t const> payload) {
+    if (payload.size() < 3 || payload[0] != 0 || payload[1] != 0 || payload[2] != 0)
+        return std::nullopt;
+    std::span<std::uint8_t const> rest = payload.subspan(3);
+    auto page = get_varint(rest);
+    if (!page || !rest.empty() || *page > UINT32_MAX) return std::nullopt;
+    return static_cast<std::uint32_t>(*page);
+}
+
 // ---------------------------------------------------------------- JournalWriter
 
 JournalWriter::JournalWriter(std::uint64_t epoch, std::uint32_t first_page)
@@ -407,6 +424,8 @@ expected<Recovered> recover(Storage const& storage, std::uint64_t epoch, std::ui
     if (first_page < 2 || first_page >= file_pages) return out;
     StreamReader r{storage, file_pages, new_page(), 0, seeded_chain(epoch), {first_page}};
     KLADDE_TRY(storage.read_at(*r.buf, std::uint64_t{first_page} * PAGE_SIZE));
+    // The pages of the journals that seals ended, before the current one.
+    std::vector<std::uint32_t> sealed_pages;
     std::size_t valid_pages = 1;
     std::uint64_t cursor = 0;
     DecodedCuts cuts;
@@ -448,13 +467,34 @@ expected<Recovered> recover(Storage const& storage, std::uint64_t epoch, std::ui
         std::array<std::uint8_t, 4> crc{};
         KLADDE_TRY_ASSIGN(bool ok, r.read(crc, false));
         if (!ok || load_u32(crc.data()) != expected_crc) break;
+        out.transactions += 1;
+        valid_pages = r.pages.size();
+        if (auto next = parse_seal(payload)) {
+            // The journal ends here, and the next epoch's begins at `next`,
+            // with a chain, a cursor and cuts of its own.
+            sealed_pages.insert(sealed_pages.end(), r.pages.begin(), r.pages.end());
+            if (*next < 2 || *next >= file_pages ||
+                std::find(sealed_pages.begin(), sealed_pages.end(), *next) != sealed_pages.end()) {
+                valid_pages = 0;
+                break;
+            }
+            epoch += 1;
+            r.chain = seeded_chain(epoch);
+            r.pages = {*next};
+            r.pos = 0;
+            KLADDE_TRY(storage.read_at(*r.buf, std::uint64_t{*next} * PAGE_SIZE));
+            valid_pages = 1;
+            cursor = 0;
+            cuts.clear();
+            continue;
+        }
         std::uint64_t at = out.records.end().at;
         KLADDE_TRY(decode_records(payload, cursor, cuts, out.records));
         out.records.mark_start(at);
-        out.transactions += 1;
-        valid_pages = r.pages.size();
     }
-    out.pages.assign(r.pages.begin(), r.pages.begin() + static_cast<std::ptrdiff_t>(valid_pages));
+    out.pages = std::move(sealed_pages);
+    out.pages.insert(out.pages.end(), r.pages.begin(),
+                     r.pages.begin() + static_cast<std::ptrdiff_t>(valid_pages));
     return out;
 }
 

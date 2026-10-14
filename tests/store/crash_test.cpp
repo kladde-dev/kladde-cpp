@@ -169,6 +169,59 @@ TEST(Crash, PowerCutsWithATinyJournal) {
     for (std::uint64_t seed = 1; seed < 150; ++seed) run(seed, opts, false);
 }
 
+namespace {
+
+/// What survives when a flush's header is lost but the transactions appended
+/// after it are not: the image as of the flush's `fsync`, plus every later
+/// write but the header's. Returns what reopening finds, and what holds
+/// every transaction.
+std::pair<Bytes, Bytes> lost_header(Options const& opts) {
+    MemoryStorage storage = MemoryStorage::with_crash_tracking();
+    Store store = Store::create(boxed(storage), opts).value();
+    // Flushes that free pages, so that a later one has a reusable page for
+    // the next journal.
+    for (std::uint8_t i = 0; i < 6; ++i) {
+        store.splice(0, store.size(), Bytes(3 * 4096, i)).value();
+        store.flush().value();
+    }
+    store.splice(0, 0, test::bytes("before")).value();
+    store.flush().value();
+    store.splice(0, 0, test::bytes("after ")).value();
+    Bytes expected = store.read_all().value();
+    Bytes after = test::bytes("after ");
+    expected.insert(expected.begin(), after.begin(), after.end());
+    // The first write after the flush's `fsync` is its header.
+    Bytes image = storage.crash_image([](std::size_t i) { return i != 0; });
+    Store reopened = Store::open(boxed(MemoryStorage::from_image(image)), opts).value();
+    reopened.check();
+    return {reopened.read_all().value(), expected};
+}
+
+}  // namespace
+
+/// Flushes that mutations trigger sync and write their header on a thread of
+/// their own, while the next transactions are appended: power cuts at every
+/// interleaving of the two must still land on a transaction boundary no
+/// earlier than the last flush that returned.
+TEST(Crash, PowerCutsWithCommitsOnAWorker) {
+    Options opts;
+    opts.journal_budget_pages = 1;
+    opts.sync_on_worker = true;
+    for (std::uint64_t seed = 1; seed < 150; ++seed) run(seed, opts, true);
+}
+
+TEST(Crash, ASealLeadsRecoveryToWhatWasAppendedAfterALostHeader) {
+    auto [found, expected] = lost_header(Options{});
+    EXPECT_EQ(found, expected);
+}
+
+TEST(Crash, WithoutASealWhatWasAppendedAfterALostHeaderIsLost) {
+    Options opts;
+    opts.seal = false;
+    auto [found, expected] = lost_header(opts);
+    EXPECT_EQ(found, Bytes(expected.begin() + 6, expected.end()));
+}
+
 /// With a journal of one page, batches are cut and flushed often, and a
 /// splice of two pages is flushed before and after.
 TEST(Crash, PowerCutsWithBatchesCutsAndOverlongSplicesInATinyJournal) {

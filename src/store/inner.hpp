@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -122,6 +123,17 @@ struct Offer {
     double fill = 0;
 };
 
+/// A commit's `fsync` and header write, on a thread of their own
+/// (impl/transactions-and-batches.md#a-flush-off-the-callers-thread).
+struct PendingCommit {
+    std::thread worker;
+    /// What the worker reports, written by it and read once it is joined.
+    std::unique_ptr<expected<void>> result;
+    /// The pages the commit before it freed, which its `fsync` makes
+    /// reusable.
+    std::vector<std::uint32_t> release;
+};
+
 /// What `Store::atomically` saved when it began, to roll back to.
 struct AtomicMark {
     Cursor end;
@@ -142,6 +154,11 @@ struct Store::Inner {
     using PageBuf = store::PageBuf;
 
     Inner(std::unique_ptr<Storage> storage, Options opts, store::JournalWriter journal);
+    /// Waits for a commit on its own thread: the file must not be left with
+    /// a header half written by a thread nobody waits for.
+    ~Inner();
+    Inner(Inner const&) = delete;
+    Inner& operator=(Inner const&) = delete;
 
     std::unique_ptr<Storage> storage;
     Options opts;
@@ -176,6 +193,15 @@ struct Store::Inner {
     /// made each, with the number of the paste's record.
     std::map<std::uint64_t, std::uint64_t> pasted;
     bool first_flush = true;
+    /// The page where the next journal begins, which the seal of the journal
+    /// being folded named; the flush's header names it too.
+    std::optional<std::uint32_t> sealed_next;
+    /// A flush's `fsync` and header write, running on a thread of their own,
+    /// and the pages that become reusable once they are done.
+    std::optional<store::PendingCommit> pending;
+    /// Whether the flush running was asked for, and so waits for its commit,
+    /// rather than triggered by a mutation.
+    bool explicit_flush = false;
     /// Data pages read at open, which decoding the sequence reads from;
     /// dropped by `end_load`.
     store::IdMap<std::unique_ptr<PageBuf>> mirror;
@@ -204,6 +230,8 @@ struct Store::Inner {
     // ------------------------------------------------------------ flush.cpp
 
     expected<void> flush_now();
+    expected<void> join_pending();
+    expected<void> seal();
     expected<bool> flush_if_journal_exceeds(double fraction);
     expected<void> fold_journal(Cursor committed);
     expected<void> flush_inner(Cursor committed);

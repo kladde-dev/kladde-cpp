@@ -306,6 +306,39 @@ TEST(Journal, ATornTailKeepsTheLongestValidPrefixAndSkipsNoHole) {
     }
 }
 
+TEST(Journal, RecoveryFollowsASealIntoTheNextEpochsJournal) {
+    MemoryStorage storage = setup(6);
+    std::uint32_t next = 4;
+    auto alloc = growing_allocator(next, false);
+    auto write = [](std::uint64_t pos, char c) {
+        std::vector<std::uint8_t> out = put({zz(static_cast<std::int64_t>(pos) << 2), 1});
+        out.push_back(static_cast<std::uint8_t>(c));
+        return out;
+    };
+    JournalWriter first(5, 2);
+    ASSERT_TRUE(first.append(write(0, 'a'), storage, alloc));
+    ASSERT_TRUE(first.append(seal_payload(3), storage, alloc));
+    // The next journal: epoch 6, cursor 0 again.
+    JournalWriter second(6, 3);
+    ASSERT_TRUE(second.append(write(1, 'b'), storage, alloc));
+    auto got = recover(storage, 5, 2);
+    ASSERT_TRUE(got);
+    EXPECT_EQ(got->transactions, 3u);
+    EXPECT_EQ(got->pages, (std::vector<std::uint32_t>{2, 3}));
+    ASSERT_EQ(got->records.all().size(), 2u);
+    EXPECT_EQ(got->records.all()[1].pos, 1u);
+    EXPECT_EQ(parse_seal(seal_payload(300)), 300u);
+    // Recovery from the next journal's own header reads it alone.
+    EXPECT_EQ(recover(storage, 6, 3)->transactions, 1u);
+}
+
+TEST(Journal, ASealWithMoreRecordsIsRefused) {
+    auto payload = seal_payload(3);
+    payload.push_back(0);
+    EXPECT_FALSE(parse_seal(payload));
+    EXPECT_TRUE(refused(payload));
+}
+
 TEST(Journal, AJournalPointerPastTheFileIsAnEmptyJournal) {
     MemoryStorage storage = setup(2);
     auto got = recover(storage, 1, 2);

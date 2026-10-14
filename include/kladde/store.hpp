@@ -38,6 +38,10 @@ public:
     /// Makes everything written so far durable: `fsync`, or
     /// `fcntl(F_FULLFSYNC)` on macOS.
     virtual expected<void> sync() = 0;
+    /// A second handle to the same bytes, which another thread may sync and
+    /// write through while this one writes elsewhere; null if there is none,
+    /// which keeps every flush on the caller's thread.
+    virtual std::unique_ptr<Storage> try_clone() const { return nullptr; }
 };
 
 /// A `Storage` over a file on disk, locked against a second process.
@@ -54,6 +58,8 @@ public:
     expected<void> write_at(std::span<std::uint8_t const> buf, std::uint64_t offset) override;
     expected<void> resize(std::uint64_t len) override;
     expected<void> sync() override;
+    /// A second handle to the same open file, sharing its lock.
+    std::unique_ptr<Storage> try_clone() const override;
 
 private:
     explicit FileStorage(int fd) : fd_(fd) {}
@@ -92,6 +98,8 @@ public:
     expected<void> write_at(std::span<std::uint8_t const> buf, std::uint64_t offset) override;
     expected<void> resize(std::uint64_t len) override;
     expected<void> sync() override;
+    /// A copy, sharing the bytes; it may be used from another thread.
+    std::unique_ptr<Storage> try_clone() const override;
 
     struct State;
 
@@ -105,6 +113,18 @@ private:
 struct Options {
     /// Pages the journal may take before a flush folds it.
     std::uint32_t journal_budget_pages = 256;
+    /// Whether a flush seals the journal it folds, naming in it where the
+    /// next journal begins, so that recovery reaches the next journal from
+    /// either header.
+    bool seal = true;
+    /// Whether a flush that a mutation triggers hands its `fsync` and its
+    /// header write to a thread of its own, so that the mutation returns
+    /// without waiting for the disk while later mutations append to the next
+    /// journal. It does so only after sealing, and only with a storage whose
+    /// `try_clone` gives a second handle; an explicit flush, `close`, the next
+    /// flush and destroying the store wait for it, and a failure on that
+    /// thread poisons the store when they do.
+    bool sync_on_worker = false;
     std::uint32_t inline_threshold = 64;
     std::uint32_t rewrite_below = 64;
     std::uint32_t span_min = 64;
@@ -187,6 +207,9 @@ struct Stats {
     /// again.
     std::uint64_t walk_merges = 0;
     std::uint64_t walk_merge_bytes = 0;
+    /// Flushes whose `fsync` and header write ran on a thread of their own
+    /// (`Options::sync_on_worker`).
+    std::uint64_t commits_on_worker = 0;
 
     // A snapshot of the file, taken when the stats are read.
     /// Pages in the file.

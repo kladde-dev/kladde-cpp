@@ -109,6 +109,28 @@ TEST(FileStorage, AStoreLivesInAFile) {
     std::filesystem::remove(path);
 }
 
+TEST(FileStorage, CommitsRunOnAWorkerThroughASecondHandle) {
+    auto path = temp_path("kladde-cpp-file-worker-test");
+    Options opts;
+    opts.journal_budget_pages = 1;
+    opts.sync_on_worker = true;
+    Bytes model;
+    {
+        Store store = Store::create(FileStorage::create(path).value(), opts).value();
+        for (int i = 0; i < 400; ++i) {
+            Bytes b(100, static_cast<std::uint8_t>(i));
+            model.insert(model.begin(), b.begin(), b.end());
+            store.splice(0, 0, b).value();
+        }
+        EXPECT_GT(store.stats().commits_on_worker, 0u);
+        // Destroying the store waits for the worker; the journal keeps the rest.
+    }
+    Store store = Store::open(FileStorage::open(path).value(), opts).value();
+    EXPECT_EQ(store.read_all().value(), model);
+    store.check();
+    std::filesystem::remove(path);
+}
+
 // ---------------------------------------------------------------- opening
 
 TEST(Store, OpeningRecoversTheJournal) {

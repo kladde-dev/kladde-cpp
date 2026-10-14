@@ -206,6 +206,30 @@ TEST(Oracle, WithoutConsolidation) {
     for (std::uint64_t seed = 1; seed < 30; ++seed) run(seed, opts, 300, 50'000);
 }
 
+TEST(Oracle, WithCommitsOnAWorker) {
+    Options opts;
+    opts.journal_budget_pages = 1;
+    opts.sync_on_worker = true;
+    std::uint64_t on_worker = 0;
+    for (std::uint64_t seed = 1; seed < 30; ++seed) {
+        OracleRng rng{{(seed * 0x9E3779B9) | 1}};
+        World w(opts);
+        for (int k = 0; k < 300; ++k) {
+            w.step(rng, 50'000);
+            on_worker += w.store.stats().commits_on_worker;
+            if (HasFailure()) {
+                ADD_FAILURE() << "seed " << seed << ", step " << k;
+                return;
+            }
+        }
+        w.store.flush().value();
+        w.verify("seed " + std::to_string(seed) + ", at the end");
+        w.reopen();
+        w.verify("seed " + std::to_string(seed) + ", reopened at the end");
+    }
+    EXPECT_GT(on_worker, 0u) << "no flush handed its commit to a worker";
+}
+
 TEST(Oracle, WithATinyJournal) {
     Options opts;
     opts.journal_budget_pages = 1;
