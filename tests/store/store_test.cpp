@@ -341,7 +341,8 @@ TEST(Store, StatsDescribeTheFile) {
     store.splice(0, 0, Bytes(20'000, 1)).value();
     store.flush().value();
     Stats s = store.stats();
-    EXPECT_EQ(s.flushes, 1u);
+    // The splice outgrows the journal budget and is folded at once.
+    EXPECT_EQ(s.flushes, 2u);
     EXPECT_EQ(s.sequence_bytes, 20'000u);
     EXPECT_EQ(s.data_pages, 5u);
     EXPECT_GT(s.live_fraction(), 0.9);

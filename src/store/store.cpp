@@ -285,7 +285,7 @@ expected<void> Store::end_batch() {
     Tx t = i.tx;
     if (t.kind == Tx::Kind::in_batch && t.batch == 1) {
         KLADDE_TRY(i.append(t.committed, i.ops.end()));
-        if (i.journal.over_budget(i.opts.journal_budget_pages)) KLADDE_TRY(i.fold_journal(i.ops.end()));
+        if (i.journal.over_budget(i.opts.journal_budget(i.len))) KLADDE_TRY(i.fold_journal(i.ops.end()));
         i.tx = Tx::immediate();
     } else if ((t.kind == Tx::Kind::in_batch && t.batch > 1) ||
                (t.kind == Tx::Kind::in_transaction && t.batch > 0) ||
@@ -418,7 +418,7 @@ void Store::Inner::truncate_ops(Cursor to) {
 }
 
 expected<Cursor> Store::Inner::close(Cursor committed, Cursor ready_at, bool in_batch) {
-    std::uint32_t budget = opts.journal_budget_pages;
+    std::uint32_t budget = opts.journal_budget(len);
     Cursor end = ops.end();
     if (ready_at == end) return committed;
     if (!journal.fits(end.bytes - committed.bytes, budget)) {

@@ -99,7 +99,7 @@ expected<bool> Store::Inner::flush_if_journal_exceeds(double fraction) {
     if (poisoned) return errc::poisoned;
     auto [committed, ready_at] = committed_and_ready(tx, ops.end());
     std::uint64_t held = journal.bytes + (ready_at.bytes - committed.bytes);
-    double budget = double(opts.journal_budget_pages) * double(JOURNAL_STREAM);
+    double budget = double(opts.journal_budget(len)) * double(JOURNAL_STREAM);
     if (double(held) < fraction * budget) return false;
     KLADDE_TRY(flush_now());
     return true;

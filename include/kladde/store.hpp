@@ -5,6 +5,7 @@
 // kladde-store.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -107,12 +108,21 @@ private:
     std::shared_ptr<State> state_;
 };
 
+/// The size of a page of a kladde file, in bytes.
+inline constexpr std::size_t page_size = 4096;
+/// The most bytes a data page holds.
+inline constexpr std::size_t max_page_content = page_size - 15;
+
 /// Tuning knobs. Everything here is policy: two stores with different
 /// options write files that read the same. The names and defaults are
 /// kladde-rs's `Options`.
 struct Options {
-    /// Pages the journal may take before a flush folds it.
-    std::uint32_t journal_budget_pages = 256;
+    /// The journal pages the journal is kept within: a transaction that would
+    /// not fit in what is left of them is preceded by a flush, and a batch is
+    /// cut where its next operation would not fit. Empty, the default, sizes
+    /// the budget to the sequence, as `journal_budget` describes; a value
+    /// fixes it at that many pages.
+    std::optional<std::uint32_t> journal_budget_pages;
     /// Whether a flush seals the journal it folds, naming in it where the
     /// next journal begins, so that recovery reaches the next journal from
     /// either header.
@@ -143,12 +153,37 @@ struct Options {
     std::size_t sample = 8;
     double hole_share = 0.25;
     std::uint32_t truncate_tail = 16;
-};
 
-/// The size of a page of a kladde file, in bytes.
-inline constexpr std::size_t page_size = 4096;
-/// The most bytes a data page holds.
-inline constexpr std::size_t max_page_content = page_size - 15;
+    /// The share of the sequence's length that the journal budget is sized
+    /// to when `journal_budget_pages` is empty.
+    static constexpr double journal_budget_share = 0.02;
+    /// The fewest journal pages a budget sized to the sequence allows.
+    static constexpr std::uint32_t journal_budget_min = 2;
+    /// The most journal pages a budget sized to the sequence allows.
+    static constexpr std::uint32_t journal_budget_max = 10;
+
+    /// The journal budget, in pages, for a sequence of `len` bytes: the
+    /// fixed `journal_budget_pages` if set, and otherwise
+    /// `journal_budget_share` of `len` in whole pages, within
+    /// `journal_budget_min` and `journal_budget_max`. The store sizes the
+    /// budget to the sequence as it stands whenever it checks the journal
+    /// against it.
+    ///
+    /// ```cpp
+    /// kladde::Options automatic;
+    /// assert(automatic.journal_budget(50'000) == 2);
+    /// assert(automatic.journal_budget(1'000'000) == 4);
+    /// assert(automatic.journal_budget(100'000'000) == 10);
+    /// kladde::Options fixed;
+    /// fixed.journal_budget_pages = 16;
+    /// assert(fixed.journal_budget(50'000) == 16);
+    /// ```
+    std::uint32_t journal_budget(std::uint64_t len) const {
+        if (journal_budget_pages) return *journal_budget_pages;
+        auto pages = static_cast<std::uint32_t>(double(len) * journal_budget_share / double(page_size));
+        return std::clamp(pages, journal_budget_min, journal_budget_max);
+    }
+};
 
 /// Counters describing the file and the work done on it since it was opened.
 ///
