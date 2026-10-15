@@ -212,6 +212,24 @@ TEST(Crash, PowerCutsWithCommitsOnAWorker) {
     for (std::uint64_t seed = 1; seed < 150; ++seed) run(seed, opts, true);
 }
 
+/// Payload pages for nearly every write and splice, written without an
+/// `fsync` beside the journal's appends: a power cut that keeps a
+/// transaction's records but not its payload pages loses the transaction.
+TEST(Crash, PowerCutsWithPayloadPages) {
+    Options opts;
+    opts.payload_threshold = 32;
+    opts.journal_budget_pages = 16;
+    for (std::uint64_t seed = 1; seed < 150; ++seed) run(seed, opts, true);
+}
+
+TEST(Crash, PowerCutsWithPayloadPagesAndCommitsOnAWorker) {
+    Options opts;
+    opts.payload_threshold = 32;
+    opts.journal_budget_pages = 4;
+    opts.sync_on_worker = true;
+    for (std::uint64_t seed = 1; seed < 150; ++seed) run(seed, opts, true);
+}
+
 TEST(Crash, ASealLeadsRecoveryToWhatWasAppendedAfterALostHeader) {
     auto [found, expected] = lost_header(Options{});
     EXPECT_EQ(found, expected);

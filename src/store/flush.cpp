@@ -103,7 +103,7 @@ expected<void> Store::Inner::seal() {
 expected<bool> Store::Inner::flush_if_journal_exceeds(double fraction) {
     if (poisoned) return errc::poisoned;
     auto [committed, ready_at] = closed();
-    std::uint64_t held = journal.bytes + (ready_at.bytes - committed.bytes);
+    std::uint64_t held = journal.held() + (ready_at.bytes - committed.bytes);
     double budget = double(opts.journal_budget(len)) * double(JOURNAL_STREAM);
     if (double(held) < fraction * budget) return false;
     KLADDE_TRY(flush_now());
@@ -155,6 +155,7 @@ expected<void> Store::Inner::flush_inner(Cursor committed) {
 
     // 4. The span table.
     KLADDE_TRY(cut(f, out));
+    out.adopted = std::move(f.adopted);
 
     // 5. Write, fsync, commit.
     return commit(e, std::move(out));
@@ -285,19 +286,27 @@ expected<void> Store::Inner::apply_pieces(std::vector<Piece> const& pieces, Flus
             touched.push_back(state.rope.last(seg));
             root = state.rope.merge(root, seg);
         } else {
-            std::uint64_t done = 0;
-            while (done < p.len) {
-                std::uint64_t n = std::min<std::uint64_t>(p.len - done, std::uint64_t{1} << 30);
-                std::size_t start = f.scratch.size();
-                f.scratch.resize(start + n);
-                ops.copy_bytes(p.start + done, std::span(f.scratch.data() + start, n));
-                stats.fresh_bytes += n;
-                std::uint32_t node = state.rope.node(RopeItem::literal(
-                    static_cast<std::uint32_t>(start), static_cast<std::uint32_t>(n)));
+            // Bytes that lie in a payload page of this epoch keep their place,
+            // as a span over it; the others are new.
+            std::uint64_t e = state.flush_epoch;
+            std::uint64_t min = std::max<std::uint64_t>(opts.rewrite_below, 1);
+            std::uint64_t at = p.start;
+            std::uint32_t prev = 0;
+            for (auto const& [s, pl] : ops.placed_in(p.start, p.len)) {
+                std::uint64_t lo = std::max(s, p.start);
+                std::uint64_t hi = std::min(s + pl.len, p.start + p.len);
+                if (hi - lo < min || pl.epoch != e) continue;
+                Placement here = pl;
+                here.len = static_cast<std::uint32_t>(hi - lo);
+                here.offset = static_cast<std::uint16_t>(pl.offset + (lo - s));
+                literal(f, at, lo - at, root, touched);
+                KLADDE_TRY_ASSIGN(std::uint32_t node, payload_span(f, here, prev));
+                prev = state.rope.item(node).id_or_start;
                 touched.push_back(node);
                 root = state.rope.merge(root, node);
-                done += n;
+                at = hi;
             }
+            literal(f, at, p.start + p.len - at, root, touched);
         }
     }
     for (Seg const& s : segs) {
@@ -310,6 +319,56 @@ expected<void> Store::Inner::apply_pieces(std::vector<Piece> const& pieces, Flus
     }
     state.root = root;
     return settle(f, touched);
+}
+
+// Appends `len` bytes of the arena from `start` to the rope as literal bytes,
+// new content the flush writes.
+void Store::Inner::literal(Flush& f, std::uint64_t start, std::uint64_t count, std::uint32_t& root,
+                           std::vector<std::uint32_t>& touched) {
+    std::uint64_t done = 0;
+    while (done < count) {
+        std::uint64_t n = std::min<std::uint64_t>(count - done, std::uint64_t{1} << 30);
+        std::size_t at = f.scratch.size();
+        f.scratch.resize(at + n);
+        ops.copy_bytes(start + done, std::span(f.scratch.data() + at, n));
+        stats.fresh_bytes += n;
+        std::uint32_t node = state.rope.node(
+            RopeItem::literal(static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(n)));
+        touched.push_back(node);
+        root = state.rope.merge(root, node);
+        done += n;
+    }
+}
+
+// A new span of the sequence over the bytes `pl` names in a payload page,
+// which the flush takes into the file as a data page of its epoch
+// (impl/flush.md#payload-pages); returns its rope node. Its id follows
+// `after`, if that is free.
+expected<std::uint32_t> Store::Inner::payload_span(Flush& f, Placement pl, std::uint32_t after) {
+    Page& page = state.pages[pl.page];
+    if (page.is(Page::State::journal)) {
+        page = Page::taken(PageKind::data);
+        f.adopted.push_back(pl.page);
+    } else if (!page.is(Page::State::filling) || page.kind != PageKind::data) {
+        return corrupt("payload page " + std::to_string(pl.page) + " is not the journal's");
+    }
+    auto id = state.new_span(after);
+    if (!id) return errc::out_of_bounds;
+    std::uint32_t node = state.rope.node(RopeItem::span(*id, pl.len));
+    Span& s = state.span_mut(*id);
+    s = Span{};
+    s.len = pl.len;
+    s.next = 0;
+    s.content = Content::ref(pl.page, pl.offset);
+    s.chain = Chain::sequence;
+    s.entry_page = NONE;
+    s.heat = state.flush_epoch;
+    s.node = node;
+    state.note_data(*id);
+    state.cover(pl.page, pl.len);
+    f.stated.insert(*id);
+    stats.adopted_bytes += pl.len;
+    return node;
 }
 
 expected<void> Store::Inner::boundary(std::uint64_t x, Flush& f) {
@@ -1020,6 +1079,7 @@ expected<void> Store::Inner::commit(std::uint64_t e, Output out) {
         (void)buf;
         written.push_back(p);
     }
+    written.insert(written.end(), out.adopted.begin(), out.adopted.end());
     written.push_back(slot);
     KLADDE_DEBUG_CHECK(written.size() == static_cast<std::size_t>(std::count_if(
                                              state.pages.begin(), state.pages.end(),
@@ -1106,10 +1166,12 @@ expected<void> Store::Inner::commit(std::uint64_t e, Output out) {
             next_retiring.push_back(p);
         }
     }
-    for (std::uint32_t p : journal.pages) {
-        if (p < file_pages && state.pages[p].is(Page::State::journal)) {
-            state.pages[p] = Page::fallback();
-            next_retiring.push_back(p);
+    for (auto const* list : {&journal.pages, &journal.payload_pages}) {
+        for (std::uint32_t p : *list) {
+            if (p < file_pages && state.pages[p].is(Page::State::journal)) {
+                state.pages[p] = Page::fallback();
+                next_retiring.push_back(p);
+            }
         }
     }
     // The header this commit replaced leaves the world; the flush moved

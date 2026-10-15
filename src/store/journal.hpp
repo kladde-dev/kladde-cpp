@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -139,6 +140,21 @@ struct JournalCuts {
     std::uint32_t distance(std::uint64_t cut) const;
 };
 
+/// Where a run of a record's bytes lies in a payload page: `len` bytes at
+/// byte `offset` of page `page`, written in epoch `epoch`, whose CRC-32C is
+/// `crc` (spec/journal.md#external-bytes).
+struct Placement {
+    std::uint32_t len = 0;
+    std::uint32_t page = 0;
+    std::uint16_t offset = 0;
+    std::uint32_t crc = 0;
+    std::uint64_t epoch = 0;
+
+    /// The run's address in the file.
+    std::uint64_t address() const { return std::uint64_t{page} * PAGE_SIZE + offset; }
+    bool operator==(Placement const&) const = default;
+};
+
 /// The one buffer of every record since the last flush, with their payloads
 /// in an arena beside them, and where each of the journal's transactions
 /// starts among them.
@@ -199,8 +215,28 @@ public:
     /// Discards the records before `to`: the front moves up to `to`.
     void discard_to(Cursor to);
 
+    /// Records that the arena's bytes from `start` on lie in a payload page
+    /// as `p` says.
+    void place(std::uint64_t start, Placement p) { placed_[start] = p; }
+    /// The placed runs that overlap the arena's bytes `[start, start + len)`,
+    /// in order, each with the arena position it starts at.
+    std::vector<std::pair<std::uint64_t, Placement>> placed_in(std::uint64_t start,
+                                                               std::uint64_t len) const;
+
 private:
+    /// Encodes `r`, as written, after a record that left off at `cursor`: a
+    /// `Write` or `Splice` whose bytes are partly or wholly placed becomes
+    /// one record per run, external where the run is placed, the first
+    /// removing what `r` removes and the rest removing nothing, so that it
+    /// still makes one cut.
+    void encode_written(Record const& r, std::uint64_t cursor, std::uint32_t distance,
+                        std::vector<std::uint8_t>& out) const;
+
     std::deque<Record> records_;
+    /// Runs of the arena that also lie in a payload page, by the arena
+    /// position they start at. A run never reaches past the bytes of the
+    /// record it belongs to.
+    std::map<std::uint64_t, Placement> placed_;
     /// The arena, its first `arena_skip_` bytes already discarded.
     std::vector<std::uint8_t> arena_;
     std::size_t arena_skip_ = 0;
@@ -231,13 +267,23 @@ struct DecodedCut {
 };
 using DecodedCuts = std::vector<DecodedCut>;
 
+/// The bytes of an external reference as recovery reads them: its address,
+/// length and checksum in, the bytes and where they lie out, or nothing if
+/// the page does not hold them (spec/journal.md#recovery).
+using Fetch = std::function<expected<std::optional<std::pair<std::vector<std::uint8_t>, Placement>>>(
+    std::uint64_t address, std::uint32_t len, std::uint32_t crc)>;
+
 /// Decodes the records of one transaction in `input` into `into`, their
 /// positions relative to `cursor`, which ends where they leave off, adding
 /// the cuts they make to the journal's `cuts`; checks the bounds and the cuts
 /// a `Paste` names, but not whether the positions lie inside the sequence,
-/// which only the fold knows.
-expected<void> decode_records(std::span<std::uint8_t const> input, std::uint64_t& cursor,
-                              DecodedCuts& cuts, Records& into);
+/// which only the fold knows. External bytes come from `fetch`.
+///
+/// Returns `false`, having taken nothing of the transaction into `into`,
+/// `cursor` or `cuts`, if `fetch` finds an external reference's bytes
+/// missing: the transaction belongs to the torn tail.
+expected<bool> decode_records(std::span<std::uint8_t const> input, std::uint64_t& cursor,
+                              DecodedCuts& cuts, Records& into, Fetch const& fetch);
 
 /// The records of a seal's transaction: the escape (a `Write` of no bytes at
 /// delta 0), escape 0, and the page where the next epoch's journal begins
@@ -256,9 +302,9 @@ public:
     /// An empty journal of epoch `epoch`, starting at `first_page`.
     JournalWriter(std::uint64_t epoch, std::uint32_t first_page);
     /// The non-empty journal that recovery found: `transactions` complete
-    /// transactions in `pages`.
+    /// transactions in `pages`, naming the payload pages `payload`.
     static JournalWriter recovered(std::uint64_t epoch, std::vector<std::uint32_t> pages,
-                                   std::uint64_t transactions);
+                                   std::vector<std::uint32_t> payload, std::uint64_t transactions);
 
     /// Whether no transaction has been appended.
     bool is_empty() const { return transactions == 0; }
@@ -271,9 +317,15 @@ public:
     /// within `budget` pages' worth of stream bytes takes at most `budget`
     /// pages.
     bool fits(std::uint64_t n, std::uint32_t budget) const;
-    /// Whether the journal has outgrown `budget` pages, which only a
-    /// transaction too large for them on its own makes it do.
+    /// Whether the journal, with its payload pages, has outgrown `budget`
+    /// pages, which only a transaction too large for them on its own makes it
+    /// do.
     bool over_budget(std::uint32_t budget) const;
+    /// What the journal holds against its budget: its stream bytes, and a
+    /// page's worth of stream for each payload page.
+    std::uint64_t held() const {
+        return bytes + payload_pages.size() * std::uint64_t{JOURNAL_STREAM};
+    }
     /// The page being appended to.
     std::uint32_t current_page() const { return pages.back(); }
 
@@ -293,6 +345,18 @@ public:
     std::uint64_t bytes = 0;
     /// Transactions appended so far.
     std::uint64_t transactions = 0;
+    /// The journal's epoch, which its payload pages' framing carries.
+    std::uint64_t epoch = 0;
+    /// The payload pages its transactions name, in the order they were taken.
+    std::vector<std::uint32_t> payload_pages;
+    /// The last payload page, while it has room: its number, its buffer, and
+    /// the content bytes it holds.
+    struct OpenPayload {
+        std::uint32_t page = 0;
+        std::unique_ptr<PageBuf> buf;
+        std::size_t used = 0;
+    };
+    std::optional<OpenPayload> open;
 
 private:
     expected<void> stream(std::span<std::uint8_t const> bytes, bool feed, Storage& storage,
@@ -318,6 +382,9 @@ struct Recovered {
     std::size_t transactions = 0;
     /// The pages the valid part of the journals occupies.
     std::vector<std::uint32_t> pages;
+    /// The payload pages its complete transactions name, in the order they
+    /// were first named.
+    std::vector<std::uint32_t> payload_pages;
 };
 
 /// Reads the valid prefix of the journal of epoch `epoch` starting at

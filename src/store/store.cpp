@@ -52,6 +52,8 @@ expected<Store> Store::open(std::unique_ptr<Storage> storage, Options opts) {
     // The page the header names for the journal is in its world, written to
     // or not, and so is every page the journal went on to.
     std::vector<std::uint32_t> journal_pages = recovered.pages;
+    journal_pages.insert(journal_pages.end(), recovered.payload_pages.begin(),
+                         recovered.payload_pages.end());
     if (jp >= 2 && jp < file_pages) journal_pages.push_back(jp);
     for (std::uint32_t p : journal_pages) {
         Page& page = state.pages[p];
@@ -62,9 +64,10 @@ expected<Store> Store::open(std::unique_ptr<Storage> storage, Options opts) {
     // A non-empty recovered journal is folded below, before anything can be
     // appended to it; an empty one is appended to from its start.
     bool fold_recovered = recovered.transactions > 0;
-    JournalWriter journal = fold_recovered ? JournalWriter::recovered(epoch + 1, recovered.pages,
-                                                                      recovered.transactions)
-                                           : JournalWriter(epoch + 1, jp);
+    JournalWriter journal =
+        fold_recovered ? JournalWriter::recovered(epoch + 1, recovered.pages,
+                                                  recovered.payload_pages, recovered.transactions)
+                       : JournalWriter(epoch + 1, jp);
     auto inner = std::make_unique<Inner>(std::move(storage), std::move(opts), std::move(journal));
     for (std::uint32_t p = 2; p < file_pages; ++p)
         if (state.pages[p].is(Page::State::reusable)) inner->ready.insert(p);
@@ -434,6 +437,10 @@ expected<Cursor> Store::Inner::close(Cursor committed, Cursor ready_at, bool in_
 expected<Cursor> Store::Inner::append(Cursor from, Cursor to) {
     if (from == to) return to;
     KLADDE_TRY(ensure_journal_page());
+    if (auto placed = place_payloads(from, to); !placed) {
+        poisoned = true;
+        return std::move(placed).error();
+    }
     std::vector<std::uint8_t> payload;
     payload.reserve(to.bytes - from.bytes);
     std::uint64_t cursor = journal.cursor;
@@ -453,6 +460,81 @@ expected<Cursor> Store::Inner::append(Cursor from, Cursor to) {
     stats.journal_bytes += journal.bytes - before;
     stats.transactions += 1;
     return to;
+}
+
+// Writes the bytes of every `Write` and `Splice` of `ops[from..to]` that
+// carries at least `Options::payload_threshold` bytes into the journal's
+// payload pages, as far as the open one has room and then a page at a time,
+// and records where they lie, so that the transaction names them rather than
+// holding them; a last part that would open a page but is shorter than the
+// threshold stays in the journal (impl/transactions-and-batches.md). Each page
+// the transaction touched is written whole, before the transaction is
+// appended.
+expected<void> Store::Inner::place_payloads(Cursor from, Cursor to) {
+    std::uint64_t t = opts.payload_threshold;
+    std::uint64_t first = journal_cuts.first;
+    std::vector<Bytes> runs;
+    KLADDE_TRY(ops.for_range(from, to, [&](bool, std::uint64_t, Record const& r) -> expected<void> {
+        Record w = r.as_written(first);
+        if ((w.kind == Record::Kind::write || w.kind == Record::Kind::splice) && w.bytes.len >= t &&
+            ops.placed_in(w.bytes.start, w.bytes.len).empty())
+            runs.push_back(w.bytes);
+        return {};
+    }));
+    bool dirty = false;
+    for (Bytes b : runs) {
+        std::uint64_t at = 0;
+        while (at < b.len) {
+            std::uint64_t left = b.len - at;
+            std::size_t room = journal.open ? MAX_PAGE_CONTENT - journal.open->used : 0;
+            if (room == 0) {
+                if (left < t) break;
+                // The last reusable page is left to the seal of the flush that
+                // a large transaction brings on: without one, that flush would
+                // not seal, and could not commit on a worker.
+                std::optional<std::uint32_t> spare;
+                if (ready.size() == 1) {
+                    spare = *ready.begin();
+                    ready.clear();
+                }
+                auto taken = take_page(Page::journal());
+                if (spare) ready.insert(*spare);
+                KLADDE_TRY_ASSIGN(std::uint32_t p, std::move(taken));
+                journal.payload_pages.push_back(p);
+                journal.open = JournalWriter::OpenPayload{p, new_page(), 0};
+                continue;
+            }
+            auto n = static_cast<std::size_t>(std::min<std::uint64_t>(left, room));
+            auto& open = *journal.open;
+            std::size_t off = CONTENT_OFFSET + open.used;
+            ops.copy_bytes(b.start + at, std::span(open.buf->data() + off, n));
+            Crc32c crc;
+            crc.update(std::span<std::uint8_t const>(open.buf->data() + off, n));
+            ops.place(b.start + at, Placement{static_cast<std::uint32_t>(n), open.page,
+                                              static_cast<std::uint16_t>(off), crc.value(),
+                                              journal.epoch});
+            open.used += n;
+            dirty = true;
+            stats.payload_bytes += n;
+            at += n;
+            if (open.used == MAX_PAGE_CONTENT) {
+                KLADDE_TRY(write_open_payload());
+                journal.open.reset();
+                dirty = false;
+            }
+        }
+    }
+    if (dirty) KLADDE_TRY(write_open_payload());
+    return {};
+}
+
+// Frames the open payload page with the journal's epoch and writes it whole.
+expected<void> Store::Inner::write_open_payload() {
+    auto& open = *journal.open;
+    seal_page(*open.buf, nullptr, KIND_DATA, journal.epoch, open.used);
+    KLADDE_TRY(storage->write_at(*open.buf, std::uint64_t{open.page} * PAGE_SIZE));
+    stats.payload_pages_written += 1;
+    return {};
 }
 
 expected<void> Store::Inner::ensure_journal_page() {

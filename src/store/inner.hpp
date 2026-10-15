@@ -83,6 +83,9 @@ struct Flush {
     IdSet stated;
     /// Those of them whose entry goes to the header; the rest go to leaves.
     IdSet header;
+    /// Payload pages whose bytes new spans show, which the commit takes into
+    /// the file as data pages without writing them.
+    std::vector<std::uint32_t> adopted;
 };
 
 /// What the flush writes, gathered before the commit.
@@ -91,6 +94,8 @@ struct Output {
     /// Leaves: page and buffer.
     std::vector<std::pair<std::uint32_t, std::unique_ptr<PageBuf>>> tables;
     std::vector<std::uint8_t> header_content;
+    /// Payload pages taken into the file as they lie.
+    std::vector<std::uint32_t> adopted;
 };
 
 /// What consolidation carries from flush to flush.
@@ -219,6 +224,8 @@ struct Store::Inner {
     void truncate_ops(Cursor to);
     expected<Cursor> close(Cursor committed, Cursor ready_at, bool in_batch);
     expected<Cursor> append(Cursor from, Cursor to);
+    expected<void> place_payloads(Cursor from, Cursor to);
+    expected<void> write_open_payload();
     expected<void> ensure_journal_page();
     expected<std::uint64_t> replayed_len() const;
     expected<void> load_mirror();
@@ -247,6 +254,9 @@ struct Store::Inner {
                                                    store::Chain chain, std::uint64_t heat,
                                                    std::uint32_t after);
     expected<void> apply_pieces(std::vector<store::Piece> const& pieces, Flush& f);
+    void literal(Flush& f, std::uint64_t start, std::uint64_t count, std::uint32_t& root,
+                 std::vector<std::uint32_t>& touched);
+    expected<std::uint32_t> payload_span(Flush& f, store::Placement pl, std::uint32_t after);
     expected<void> boundary(std::uint64_t x, Flush& f);
     void insert_at(std::uint64_t x, std::uint32_t m);
     expected<void> settle(Flush& f, std::vector<std::uint32_t> const& touched);

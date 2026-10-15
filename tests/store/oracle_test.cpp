@@ -236,6 +236,20 @@ TEST(Oracle, WithATinyJournal) {
     for (std::uint64_t seed = 1; seed < 30; ++seed) run(seed, opts, 300, 50'000);
 }
 
+TEST(Oracle, WithPayloadPagesForNearlyEveryWrite) {
+    Options opts;
+    opts.payload_threshold = 16;
+    for (std::uint64_t seed = 1; seed < 40; ++seed) run(seed, opts, 300, 50'000);
+}
+
+TEST(Oracle, WithPayloadPagesALargeJournalAndCommitsOnAWorker) {
+    Options opts;
+    opts.payload_threshold = 100;
+    opts.journal_budget_pages = 32;
+    opts.sync_on_worker = true;
+    for (std::uint64_t seed = 1; seed < 40; ++seed) run(seed, opts, 300, 50'000);
+}
+
 TEST(Oracle, WithEagerMergesAndATinyHeader) {
     // Every flush walks the whole sequence, everything is cold at once, and
     // short spans merge readily.

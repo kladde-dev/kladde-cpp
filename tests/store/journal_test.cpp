@@ -20,6 +20,15 @@ MemoryStorage setup(std::uint64_t pages) {
     return s;
 }
 
+// Decodes a transaction that names no payload page.
+expected<bool> decode_inline(std::span<std::uint8_t const> input, std::uint64_t& cursor,
+                             DecodedCuts& cuts, Records& into) {
+    return decode_records(input, cursor, cuts, into, [](std::uint64_t, std::uint32_t, std::uint32_t)
+                              -> expected<std::optional<std::pair<std::vector<std::uint8_t>, Placement>>> {
+        return corrupt("no payload pages here");
+    });
+}
+
 struct Rng {
     std::uint64_t state;
     std::uint64_t next(std::uint32_t bits) {
@@ -109,7 +118,7 @@ bool refused(std::vector<std::uint8_t> const& out) {
     std::uint64_t cursor = 0;
     DecodedCuts cuts;
     Records recs;
-    return !decode_records(out, cursor, cuts, recs);
+    return !decode_inline(out, cursor, cuts, recs);
 }
 
 NextPage growing_allocator(std::uint32_t& next, bool grow) {
@@ -146,7 +155,7 @@ TEST(Journal, RecordsRoundTripAndRecordLenCountsTheEncoding) {
         EXPECT_GE(to.bytes - from.bytes, out.size());
         total += out.size();
         std::uint64_t at = decoded.end().at;
-        ASSERT_TRUE(decode_records(out, dcursor, dcuts, decoded));
+        ASSERT_TRUE(decode_inline(out, dcursor, dcuts, decoded));
         decoded.mark_start(at);
     }
     EXPECT_LE(total, recs.end().bytes);
@@ -180,8 +189,8 @@ TEST(Journal, APasteNamesACutOfAnEarlierTransactionOfItsJournal) {
     std::uint64_t cursor = 0;
     DecodedCuts cuts;
     Records recs;
-    ASSERT_TRUE(decode_records(first, cursor, cuts, recs));
-    ASSERT_TRUE(decode_records(second, cursor, cuts, recs));
+    ASSERT_TRUE(decode_inline(first, cursor, cuts, recs));
+    ASSERT_TRUE(decode_inline(second, cursor, cuts, recs));
     EXPECT_EQ(recs.all().at(1), Record::paste(0, 0, 0, 2, std::nullopt));
 }
 
@@ -207,7 +216,7 @@ TEST(Journal, AWriteMakesACutOfItsLength) {
     std::uint64_t cursor = 0;
     DecodedCuts cuts;
     Records recs;
-    ASSERT_TRUE(decode_records(out, cursor, cuts, recs));
+    ASSERT_TRUE(decode_inline(out, cursor, cuts, recs));
     EXPECT_EQ(recs.all().at(1), Record::paste(0, 0, 0, 2, std::nullopt));
 }
 
@@ -269,7 +278,7 @@ TEST(Journal, TransactionsAcrossManyPagesRoundTrip) {
 }
 
 TEST(Journal, ARecoveredJournalNeverFitsAnything) {
-    JournalWriter w = JournalWriter::recovered(1, {2, 3}, 4);
+    JournalWriter w = JournalWriter::recovered(1, {2, 3}, {}, 4);
     EXPECT_FALSE(w.is_empty());
     EXPECT_FALSE(w.fits(0, UINT32_MAX));
 }

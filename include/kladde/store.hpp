@@ -178,6 +178,14 @@ struct Options {
     /// thread poisons the store when they do.
     bool sync_on_worker = false;
     std::uint32_t inline_threshold = 64;
+    /// The bytes of a write or splice of at least this many bytes are written
+    /// once, into data pages of their own that the journal names, rather than
+    /// into the journal and then again by the flush; `UINT32_MAX` keeps every
+    /// write's bytes in the journal. Either way the bytes are in the
+    /// journal's world when the call returns, and those data pages count
+    /// toward `journal_budget_pages`, so a write larger than the budget is
+    /// followed by a flush, which keeps them where they lie.
+    std::uint32_t payload_threshold = 2048;
     std::uint32_t rewrite_below = 64;
     std::uint32_t span_min = 64;
     std::uint32_t cold_flushes = 16;
@@ -242,6 +250,12 @@ struct Stats {
     std::uint64_t transactions = 0;
     /// Journal stream bytes appended.
     std::uint64_t journal_bytes = 0;
+    /// Bytes of writes and splices written into payload pages rather than
+    /// into the journal, and the payload page writes that took.
+    std::uint64_t payload_bytes = 0;
+    std::uint64_t payload_pages_written = 0;
+    /// Bytes flushes took into the file where payload pages held them.
+    std::uint64_t adopted_bytes = 0;
     /// Data pages written by flushes.
     std::uint64_t data_pages_written = 0;
     /// Span-table pages written by flushes, headers excluded.
