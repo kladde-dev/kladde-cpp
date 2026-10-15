@@ -229,6 +229,12 @@ struct Store::Inner {
 
     // ------------------------------------------------------------ flush.cpp
 
+    /// The committed cursor, and the end of the operations outside any open
+    /// transaction: `ops[committed..ready]` is a batch's ready run, or empty.
+    std::pair<Cursor, Cursor> closed() const;
+    /// Appends a batch's ready run to the journal, and returns the committed
+    /// cursor after.
+    expected<Cursor> append_ready();
     expected<void> flush_now();
     expected<void> join_pending();
     expected<void> seal();
@@ -269,6 +275,10 @@ struct Store::Inner {
                      std::vector<store::Placed> const& placed);
     expected<void> commit(std::uint64_t e, Output out);
     expected<void> truncate(bool force);
+
+    // ------------------------------------------------------------ compact.cpp
+
+    expected<void> close_consolidated();
 
     // ------------------------------------------------------------ consolidate.cpp
 

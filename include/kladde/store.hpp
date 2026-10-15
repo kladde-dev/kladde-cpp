@@ -43,6 +43,33 @@ public:
     /// write through while this one writes elsewhere; null if there is none,
     /// which keeps every flush on the caller's thread.
     virtual std::unique_ptr<Storage> try_clone() const { return nullptr; }
+    /// A new, empty storage beside this one, for `replace_with` to put in its
+    /// place once it is written and synced; destroying it instead discards
+    /// it. Fails unless the implementation provides it: `FileStorage` makes a
+    /// hidden temporary file in the same directory.
+    ///
+    /// ```cpp
+    /// kladde::MemoryStorage s;
+    /// auto fresh = s.sibling().value();
+    /// fresh->resize(3).value();
+    /// fresh->write_at(bytes("new"), 0).value();
+    /// fresh->sync().value();
+    /// s.replace_with(std::move(fresh)).value();
+    /// assert(s.image() == bytes("new"));
+    /// ```
+    virtual expected<std::unique_ptr<Storage>> sibling() const {
+        return error{errc::io, "this storage cannot make a sibling"};
+    }
+    /// Puts `sibling`, which `sibling()` made and which has been synced since
+    /// its last write, in this storage's place; this storage reads and writes
+    /// the sibling's bytes afterwards. The replacement is atomic: after a
+    /// power cut, the storage holds either all of its old bytes or all of the
+    /// sibling's. Fails if `sibling` is of another type, or unless the
+    /// implementation provides it.
+    virtual expected<void> replace_with(std::unique_ptr<Storage> sibling) {
+        sibling.reset();
+        return error{errc::io, "this storage cannot be replaced"};
+    }
 };
 
 /// A `Storage` over a file on disk, locked against a second process.
@@ -61,10 +88,20 @@ public:
     expected<void> sync() override;
     /// A second handle to the same open file, sharing its lock.
     std::unique_ptr<Storage> try_clone() const override;
+    /// A hidden temporary file in the same directory, locked.
+    expected<std::unique_ptr<Storage>> sibling() const override;
+    /// Renames the sibling's file over this one's and syncs the directory;
+    /// the lock moves with the file.
+    expected<void> replace_with(std::unique_ptr<Storage> sibling) override;
 
 private:
-    explicit FileStorage(int fd) : fd_(fd) {}
+    FileStorage(int fd, std::filesystem::path path, bool temporary = false)
+        : fd_(fd), path_(std::move(path)), temporary_(temporary) {}
     int fd_;
+    std::filesystem::path path_;
+    /// Whether this is a sibling that no `replace_with` took yet, whose file
+    /// destroying it removes.
+    bool temporary_;
 };
 
 /// A `Storage` in memory, for tests: shares its bytes with its copies, can
@@ -101,6 +138,11 @@ public:
     expected<void> sync() override;
     /// A copy, sharing the bytes; it may be used from another thread.
     std::unique_ptr<Storage> try_clone() const override;
+    /// A new, empty `MemoryStorage`.
+    expected<std::unique_ptr<Storage>> sibling() const override;
+    /// Takes the sibling's bytes as this storage's durable state, which every
+    /// copy of it then shares.
+    expected<void> replace_with(std::unique_ptr<Storage> sibling) override;
 
     struct State;
 
@@ -384,6 +426,30 @@ public:
     expected<bool> flush_if_journal_exceeds(double fraction);
     /// Flushes, then shrinks the file to end at its last needed page.
     expected<void> close();
+    /// Closes the file by replacing it with a fully consolidated copy of
+    /// itself: the smallest file that holds its content, with an empty
+    /// journal.
+    ///
+    /// Writes the schema, the sequence and the private chain back to back
+    /// into full data pages of a new storage that `Storage::sibling` makes,
+    /// syncs it, and puts it in the old one's place with
+    /// `Storage::replace_with`; the operations of an open transaction are
+    /// discarded. It takes time linear in the file's content, rather than in
+    /// what changed since the last flush, and holds one page of it in memory
+    /// at a time. A crash or a failure at any point leaves the old file, or
+    /// the new one, with everything recorded before the call. Afterwards the
+    /// store is poisoned, whether the call succeeded or not: destroy it, and
+    /// open the file again to go on.
+    ///
+    /// ```cpp
+    /// kladde::MemoryStorage storage;
+    /// auto store = kladde::Store::create(storage.try_clone()).value();
+    /// for (std::uint64_t i = 0; i < 1000; ++i) store.splice(i, 0, bytes("x")).value();
+    /// store.close_consolidated().value();
+    /// // A header, a blank header slot, and one data page.
+    /// assert(storage.size().value() == 3 * kladde::page_size);
+    /// ```
+    expected<void> close_consolidated();
 
     /// The schema chain's content.
     std::vector<std::uint8_t> schema() const;

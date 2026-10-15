@@ -19,8 +19,16 @@ namespace {
 /// The largest run of bytes a span shows from a data page.
 constexpr std::uint32_t C = MAX_PAGE_CONTENT;
 
-/// The cursors a state implies for its committed run and a batch's ready run.
-std::pair<Cursor, Cursor> committed_and_ready(Tx const& tx, Cursor end) {
+std::vector<std::uint32_t> sorted(IdSet const& s) {
+    std::vector<std::uint32_t> v(s.begin(), s.end());
+    std::sort(v.begin(), v.end());
+    return v;
+}
+
+}  // namespace
+
+std::pair<Cursor, Cursor> Store::Inner::closed() const {
+    Cursor end = ops.end();
     switch (tx.kind) {
         case Tx::Kind::immediate: return {end, end};
         case Tx::Kind::in_batch: return {tx.committed, end};
@@ -30,19 +38,16 @@ std::pair<Cursor, Cursor> committed_and_ready(Tx const& tx, Cursor end) {
     return {end, end};
 }
 
-std::vector<std::uint32_t> sorted(IdSet const& s) {
-    std::vector<std::uint32_t> v(s.begin(), s.end());
-    std::sort(v.begin(), v.end());
-    return v;
+expected<Cursor> Store::Inner::append_ready() {
+    auto [committed, ready_at] = closed();
+    KLADDE_TRY_ASSIGN(Cursor c, append(committed, ready_at));
+    tx = tx.with_committed(c);
+    return c;
 }
-
-}  // namespace
 
 expected<void> Store::Inner::flush_now() {
     if (poisoned) return errc::poisoned;
-    auto [committed, ready_at] = committed_and_ready(tx, ops.end());
-    KLADDE_TRY_ASSIGN(Cursor c, append(committed, ready_at));
-    tx = tx.with_committed(c);
+    KLADDE_TRY_ASSIGN(Cursor c, append_ready());
     // An explicit flush returns once what it folded is durable.
     explicit_flush = true;
     auto r = fold_journal(c);
@@ -97,7 +102,7 @@ expected<void> Store::Inner::seal() {
 
 expected<bool> Store::Inner::flush_if_journal_exceeds(double fraction) {
     if (poisoned) return errc::poisoned;
-    auto [committed, ready_at] = committed_and_ready(tx, ops.end());
+    auto [committed, ready_at] = closed();
     std::uint64_t held = journal.bytes + (ready_at.bytes - committed.bytes);
     double budget = double(opts.journal_budget(len)) * double(JOURNAL_STREAM);
     if (double(held) < fraction * budget) return false;

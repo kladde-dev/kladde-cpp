@@ -45,20 +45,47 @@ expected<int> open_locked(std::filesystem::path const& path, int flags) {
 
 expected<std::unique_ptr<FileStorage>> FileStorage::open(std::filesystem::path const& path) {
     KLADDE_TRY_ASSIGN(int fd, open_locked(path, O_RDWR));
-    return std::unique_ptr<FileStorage>(new FileStorage(fd));
+    return std::unique_ptr<FileStorage>(new FileStorage(fd, path));
 }
 
 expected<std::unique_ptr<FileStorage>> FileStorage::create(std::filesystem::path const& path) {
     // Truncated only once locked, so that a file another process holds open
     // is never emptied under it.
     KLADDE_TRY_ASSIGN(int fd, open_locked(path, O_RDWR | O_CREAT));
-    auto s = std::unique_ptr<FileStorage>(new FileStorage(fd));
+    auto s = std::unique_ptr<FileStorage>(new FileStorage(fd, path));
     if (::ftruncate(fd, 0) != 0) return errno_error("ftruncate");
     return s;
 }
 
 FileStorage::~FileStorage() {
+    if (temporary_) ::unlink(path_.c_str());
     if (fd_ >= 0) ::close(fd_);
+}
+
+expected<std::unique_ptr<Storage>> FileStorage::sibling() const {
+    std::string name = "." + path_.filename().string() + "." + std::to_string(::getpid());
+    for (int n = 0;; ++n) {
+        auto path = path_;
+        path.replace_filename(name + (n > 0 ? "." + std::to_string(n) : "") + ".tmp");
+        auto fd = open_locked(path, O_RDWR | O_CREAT | O_EXCL);
+        if (fd) return std::unique_ptr<Storage>(new FileStorage(*fd, path, true));
+        if (errno != EEXIST || n >= 100) return fd.error();
+    }
+}
+
+expected<void> FileStorage::replace_with(std::unique_ptr<Storage> sibling) {
+    auto* s = dynamic_cast<FileStorage*>(sibling.get());
+    if (!s) return error{errc::io, "a sibling of another kind of storage"};
+    if (::rename(s->path_.c_str(), path_.c_str()) != 0) return errno_error("rename");
+    s->temporary_ = false;
+    auto dir = path_.parent_path();
+    int dfd = ::open(dir.empty() ? "." : dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) return errno_error("open the directory");
+    int synced = ::fsync(dfd);
+    ::close(dfd);
+    if (synced != 0) return errno_error("fsync the directory");
+    std::swap(fd_, s->fd_);
+    return {};
 }
 
 expected<std::uint64_t> FileStorage::size() const {
@@ -116,7 +143,7 @@ std::unique_ptr<Storage> FileStorage::try_clone() const {
     // the lock, which stays held until every descriptor is closed.
     int fd = ::fcntl(fd_, F_DUPFD_CLOEXEC, 0);
     if (fd < 0) return nullptr;
-    return std::unique_ptr<Storage>(new FileStorage(fd));
+    return std::unique_ptr<Storage>(new FileStorage(fd, path_));
 }
 
 // ---------------------------------------------------------------- MemoryStorage
@@ -212,6 +239,28 @@ void MemoryStorage::fail_after(std::uint64_t n) {
 
 std::unique_ptr<Storage> MemoryStorage::try_clone() const {
     return std::make_unique<MemoryStorage>(*this);
+}
+
+expected<std::unique_ptr<Storage>> MemoryStorage::sibling() const {
+    return std::unique_ptr<Storage>(std::make_unique<MemoryStorage>());
+}
+
+expected<void> MemoryStorage::replace_with(std::unique_ptr<Storage> sibling) {
+    auto* s = dynamic_cast<MemoryStorage*>(sibling.get());
+    if (!s) return error{errc::io, "a sibling of another kind of storage"};
+    std::vector<std::uint8_t> bytes;
+    {
+        std::lock_guard lock(s->state_->mutex);
+        bytes = std::move(s->state_->current);
+    }
+    std::lock_guard lock(state_->mutex);
+    KLADDE_TRY(state_->dead());
+    if (state_->track) {
+        state_->durable = bytes;
+        state_->since_sync.clear();
+    }
+    state_->current = std::move(bytes);
+    return {};
 }
 
 expected<std::uint64_t> MemoryStorage::size() const {

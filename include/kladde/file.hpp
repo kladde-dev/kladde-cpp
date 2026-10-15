@@ -150,6 +150,12 @@ public:
     }
     /// Flushes, then gives unused space at the end of the file back.
     void close() { check(s_->store_backend, s_->store.close()); }
+    /// Closes the file by replacing it with a fully consolidated copy of
+    /// itself, the smallest file that holds the value, as
+    /// `Store::close_consolidated` describes; for when the user closes a
+    /// document. The `File` is poisoned afterwards: open the file again to
+    /// go on.
+    void close_consolidated() { check(s_->store_backend, s_->store.close_consolidated()); }
 
     Stats stats() const { return s_->store.stats(); }
     Store& store() { return s_->store; }
